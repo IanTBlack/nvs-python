@@ -1,11 +1,11 @@
 '''TODO
-- Implement haversine formula.
-- Implement direction with distance.
+- Implement numpy for faster array calculations.
 - Fine tune check_asset_data_age to represent days, hours, minutes, seconds.
 - Format get_recent_data output to be more intuitive.
 '''
 
-from datetime import datetime,timedelta, timezone
+from datetime import datetime,timedelta,timezone
+import math
 from pyproj import Proj
 import pytz
 import requests
@@ -43,12 +43,7 @@ class NVS():
             return assets
     
     def _set_projection(self):
-        '''Set the projection for UTM conversion.
-        @param lon -- the longitude of the ship in decimal degrees. 
-        Note: The longitude is used to determine the UTM zone. This was coded
-        to only consider assets that exist within NVS. This will need to be
-        updated if assets exist outside of UTM zones 8-10.
-        '''
+        '''Set the projection for UTM conversion.'''
         if self.ship_lon >= -126:
             zone = 10
         elif -129 < self.ship_lon < -126:
@@ -56,64 +51,164 @@ class NVS():
         elif self.ship_lon <= -129:
             zone = 8
         self.projection = Proj(proj='utm',zone=zone,ellps='WGS84')
+     
     
-    def _is_in_range(self,asset_lat,asset_lon,radius):
-        '''Deterimine if an asset is in range of the ship lat/lon using
-        the equation of a circle on UTM values.
-        @param asset_lat -- the latitude of the asset in decimal degrees.
-        @param asset_lon -- the longitude of the asset in decimal degrees.
-        @param -- the distance from the ship to consider as "nearby".
-        @return -- True if the asset is in the radius, False if not.
-        '''
+    def _get_haversine_distance(self):
+        '''Compute the Great Circle distance between the ship and an asset.'''
+        R = 6371e3
+        phi_ship = self.ship_lat * math.pi/180
+        phi_asset = self.asset_lat * math.pi/180
+        delta_phi = (self.asset_lat - self.ship_lat) * math.pi/180
+        delta_lambda = (self.asset_lon - self.ship_lon) * math.pi/180
+        a = (math.sin(delta_phi/2) * math.sin(delta_phi/2) + math.cos(phi_ship) 
+        * math.cos(phi_asset) * math.sin(delta_lambda/2) 
+        * math.sin(delta_lambda/2))
+        c = 2 * math.atan2(math.sqrt(a),math.sqrt(1-a))
+        self.haversine = R *c
+        
+    def _get_manhattan_distance(self):
+        '''Compute the manhattan distance between the ship and an asset.
+            This is the "taxicab" distance or sum of the x and y deltas
+            between the ship and asset using UTM.'''
+        self._set_projection()         
         ship_x,ship_y = self.projection(self.ship_lon,self.ship_lat)        
-        asset_x,asset_y = self.projection(asset_lon,asset_lat)
-        left = (asset_x-ship_x)**2 + (asset_y-ship_y)**2 #(x-h)^2 + (y-k)^2
-        right = radius**2 #r^2
-        if left <= right: # If (x-h)^2 + (y-k)^2 <= r^2
+        asset_x,asset_y = self.projection(self.asset_lon,self.asset_lat)
+        self.manhattan_x = asset_x - ship_x
+        self.manhattan_y = asset_y - ship_y
+        self.manhattan = abs(self.manhattan_x) + abs(self.manhattan_y)
+
+    def _get_euclidian_distance(self):
+        '''Compute the euclidian distance between the ship and an asset.
+           This is the straight line distance between two points.'''
+        self._get_manhattan_distance()
+        self.euclidian=math.sqrt((self.manhattan_x)**2 + (self.manhattan_y)**2)
+            
+    def get_distance_from_ship(self,ship_lat,ship_lon,asset_lat,asset_lon,
+                               method="haversine"):
+        '''Get an assets distance from the ship using a given method.
+        @param ship_lat -- latitude of the ship in decimal degrees.
+        @param ship_lon -- longitude of the ship in decimal degrees.
+        @param asset_lat -- latitude of the asset in decimal degrees.
+        @param asset_lon -- longitude of the asset in decimal degees.
+        @param method -- how to calculate the distance. 
+                          options: haversine, euclidian, manhattan
+        @return -- distance between the ship and asset in meters.
+        '''
+        self.ship_lat = ship_lat
+        self.ship_lon = ship_lon       
+        self.asset_lat = asset_lat
+        self.asset_lon = asset_lon
+        if method == "haversine":
+            self._get_haversine_distance()
+            distance = self.haversine
+        elif method == "euclidian":
+            self._get_euclidian_distance()
+            distance =  self.euclidian
+        elif method == "manhattan":
+            self._get_manhattan_distance()
+            distance =  self.manhattan
+        return int(distance)
+
+    def get_bearing_from_ship(self,ship_lat,ship_lon,asset_lat,asset_lon):  
+        '''Get the assets bearing from the ship.
+        NOTE: 0 is North, 90 is East, 180 is South, 270 is West.
+        @param ship_lat -- latitude of the ship in decimal degrees.
+        @param ship_lon -- longitude of the ship in decimal degrees.
+        @param asset_lat -- latitude of the asset in decimal degrees.
+        @param asset_lon -- longitude of the asset in decimal degees.
+        @return -- the bearing in degrees.
+        '''
+        delta_lambda = math.radians(asset_lon-ship_lon)
+        phi_ship = math.radians(ship_lat)
+        phi_asset = math.radians(asset_lat)
+        y = math.sin(delta_lambda)* math.cos(phi_asset)
+        x = (math.cos(phi_ship) * math.sin(phi_asset) - math.sin(phi_ship) 
+        * math.cos(phi_asset) * math.cos(delta_lambda))
+        bearing = math.degrees(math.atan2(y,x)) % 360
+        return int(bearing)  
+
+    def _is_in_range(self,distance,method="haversine"):  
+        '''Determine if an asset is within the watch circle of a ship.
+        @param distance -- the distance in meters.
+        @param method -- how to calculate the distance. 
+                          options: haversine, euclidian, manhattan
+        @return -- True if it is within the watch circle distance, False if not
+        '''
+        if method == "haversine":
+            self._get_haversine_distance()
+            asset_distance = self.haversine
+        elif method == "euclidian":
+            self._get_euclidian_distance()
+            asset_distance = self.euclidian
+        elif method == "manhattan":
+            self._get_manhattan_distance()
+            asset_distance = self.manhattan
+        if asset_distance <= distance:
             return True
         else:
             return False
-    
-    def get_nearby_assets_metadata(self,ship_lat,ship_lon,
-                          radius=5000,online=False):
-        '''Get a list of assets that are near the ship.
-        @param ship_lat -- the ship latitude in decimal degrees.
-        @param ship_lon -- the ship longitude in decimal degrees.
-        @param radius -- the distance in meters to look for nearby assets.
-        @online -- if set to True, only considers assets that are "online".
-        @return -- a list of assets within x meters of the ship.
+        
+    def get_nearby_assets_metadata(self,ship_lat,ship_lon,distance=10000,
+                                   method="haversine",online=True):
+        '''Get the metadata info of all assets within a watch circle.
+        @param ship_lat -- latitude of the ship in decimal degrees.
+        @param ship_lon -- longitude of the ship in decimal degrees
+        @param distance -- watch circle radius in meters.
+        @param method -- how to calculate the distance. 
+                          options: haversine, euclidian, manhattan       
+        @param online -- only get the metadata for active assets if True.
+        @return -- an array of dictionaries that contain asset metadata.
         '''
         self.ship_lat = ship_lat
         self.ship_lon = ship_lon
-        self._set_projection()        
         assets = self.get_all_assets_metadata(online=online)
         nearby = []
         for asset in assets:
-            asset_lat = asset['lat']
-            asset_lon = asset['lon']
-            if self._is_in_range(asset_lat,asset_lon,radius):
+            self.asset_lat = asset['lat']
+            self.asset_lon = asset['lon']
+            if self._is_in_range(distance,method) is True:
                 nearby.append(asset)
-        return nearby
-
-    def get_distance_from_ship(self,ship_lat,ship_lon,asset_lat,asset_lon):
-        '''Compute the Euclidian distance in meters between the ship 
-        and an asset.
-        @param ship_lat -- the latitude of the ship in decimal degrees.
-        @param ship_lon -- the longitude of the ship in decimal degrees.
-        @param asset_lat -- the latitude of the asset in decimal degrees.
-        @param asset_lon -- the longitude of the asset in decimal degrees.
-        @return -- the Euclidian distance between the two points in meters.
-            Rounded according to Python's int functionality.
+            else:
+                continue
+        if nearby == []:
+            return None
+        else:
+            return nearby
+               
+    def get_asset_distance_bearing(self,ship_lat,ship_lon,asset,
+                                   method="haversine"):
+        '''Get an asset's distance and bearing from the ship.
+        @param ship_lat -- latitude of the ship in decimal degrees.
+        @param ship_lon -- longitude of the ship in decimal degrees
+        @param method -- how to calculate the distance. 
+                          options: haversine, euclidian, manhattan         
+        @return -- the asset's distance in meters and bearing in degrees.
         '''
-        self.ship_lat = ship_lat
-        self.ship_lon = ship_lon
-        self._set_projection()         
-        ship_x,ship_y = self.projection(ship_lon,ship_lat)        
-        asset_x,asset_y = self.projection(asset_lon,asset_lat)      
-        distance = ((ship_lat - asset_lat)**2 + (ship_lon - asset_lon)**2)**0.5
-        distance = int(distance*100000)
-        return distance
+        
+        asset_lat = asset['lat']
+        asset_lon = asset['lon']
+        distance = self.get_distance_from_ship(ship_lat,ship_lon,
+                                               asset_lat,asset_lon,
+                                               method = method)
+        bearing = self.get_bearing_from_ship(ship_lat,ship_lon,
+                                             asset_lat,asset_lon)
+        return distance,bearing
+        
     
+    def get_nearby_distance_bearing(self,ship_lat,ship_lon,distance,
+                                    method="haversine",online=True):
+        nearby = self.get_nearby_assets_metadata(ship_lat,ship_lon,distance,
+                                                 method,online)
+        db = []
+        for asset in nearby:
+            asset_lat = asset['lat']
+            asset_lon = asset['lon']        
+            d,b = self.get_asset_distance_bearing(ship_lat,ship_lon,
+                                                  asset,method)
+            info = [asset_lat,asset_lon,d,b]
+            db.append(info)
+        return db
+
     def check_asset_data_age(self,asset):
         '''Get the asset data age.
         @param asset -- a dict that must contain the asset's siso_id.
